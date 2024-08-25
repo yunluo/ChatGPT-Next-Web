@@ -1,14 +1,32 @@
+"use client";
+// azure and openai, using same models. so using same LLMApi.
 import {
   ApiPath,
   DEFAULT_API_HOST,
   DEFAULT_MODELS,
   OpenaiPath,
+  Azure,
   REQUEST_TIMEOUT_MS,
   ServiceProvider,
 } from "@/app/constant";
 import { useAccessStore, useAppConfig, useChatStore } from "@/app/store";
+import { collectModelsWithDefaultModel } from "@/app/utils/model";
+import {
+  preProcessImageContent,
+  uploadImage,
+  base64Image2Blob,
+} from "@/app/utils/chat";
+import { cloudflareAIGatewayUrl } from "@/app/utils/cloudflare";
+import { DalleSize, DalleQuality, DalleStyle } from "@/app/typing";
 
-import { ChatOptions, getHeaders, LLMApi, LLMModel, LLMUsage } from "../api";
+import {
+  ChatOptions,
+  getHeaders,
+  LLMApi,
+  LLMModel,
+  LLMUsage,
+  MultimodalContent,
+} from "../api";
 import Locale from "../../locales";
 import {
   EventStreamContentType,
@@ -16,7 +34,12 @@ import {
 } from "@fortaine/fetch-event-source";
 import { prettyObject } from "@/app/utils/format";
 import { getClientConfig } from "@/app/config/client";
-import { makeAzurePath } from "@/app/azure";
+import {
+  getMessageTextContent,
+  getMessageImages,
+  isVisionModel,
+  isDalle3 as _isDalle3,
+} from "@/app/utils";
 
 export interface OpenAIListModelResponse {
   object: string;
@@ -27,79 +50,189 @@ export interface OpenAIListModelResponse {
   }>;
 }
 
+export interface RequestPayload {
+  messages: {
+    role: "system" | "user" | "assistant";
+    content: string | MultimodalContent[];
+  }[];
+  stream?: boolean;
+  model: string;
+  temperature: number;
+  presence_penalty: number;
+  frequency_penalty: number;
+  top_p: number;
+  max_tokens?: number;
+}
+
+export interface DalleRequestPayload {
+  model: string;
+  prompt: string;
+  response_format: "url" | "b64_json";
+  n: number;
+  size: DalleSize;
+  quality: DalleQuality;
+  style: DalleStyle;
+}
+
 export class ChatGPTApi implements LLMApi {
   private disableListModels = true;
 
   path(path: string): string {
     const accessStore = useAccessStore.getState();
 
-    const isAzure = accessStore.provider === ServiceProvider.Azure;
+    let baseUrl = "";
 
-    if (isAzure && !accessStore.isValidAzure()) {
-      throw Error(
-        "incomplete azure config, please check it in your settings page",
-      );
+    const isAzure = path.includes("deployments");
+    if (accessStore.useCustomConfig) {
+      if (isAzure && !accessStore.isValidAzure()) {
+        throw Error(
+          "incomplete azure config, please check it in your settings page",
+        );
+      }
+
+      baseUrl = isAzure ? accessStore.azureUrl : accessStore.openaiUrl;
     }
-
-    let baseUrl = isAzure ? accessStore.azureUrl : accessStore.openaiUrl;
 
     if (baseUrl.length === 0) {
       const isApp = !!getClientConfig()?.isApp;
-      baseUrl = isApp ? DEFAULT_API_HOST : ApiPath.OpenAI;
+      const apiPath = isAzure ? ApiPath.Azure : ApiPath.OpenAI;
+      baseUrl = isApp ? DEFAULT_API_HOST + "/proxy" + apiPath : apiPath;
     }
 
     if (baseUrl.endsWith("/")) {
       baseUrl = baseUrl.slice(0, baseUrl.length - 1);
     }
-    if (!baseUrl.startsWith("http") && !baseUrl.startsWith(ApiPath.OpenAI)) {
+    if (
+      !baseUrl.startsWith("http") &&
+      !isAzure &&
+      !baseUrl.startsWith(ApiPath.OpenAI)
+    ) {
       baseUrl = "https://" + baseUrl;
     }
 
-    if (isAzure) {
-      path = makeAzurePath(path, accessStore.azureApiVersion);
-    }
+    console.log("[Proxy Endpoint] ", baseUrl, path);
 
-    return [baseUrl, path].join("/");
+    // try rebuild url, when using cloudflare ai gateway in client
+    return cloudflareAIGatewayUrl([baseUrl, path].join("/"));
   }
 
-  extractMessage(res: any) {
-    return res.choices?.at(0)?.message?.content ?? "";
+  async extractMessage(res: any) {
+    if (res.error) {
+      return "```\n" + JSON.stringify(res, null, 4) + "\n```";
+    }
+    // dalle3 model return url, using url create image message
+    if (res.data) {
+      let url = res.data?.at(0)?.url ?? "";
+      const b64_json = res.data?.at(0)?.b64_json ?? "";
+      if (!url && b64_json) {
+        // uploadImage
+        url = await uploadImage(base64Image2Blob(b64_json, "image/png"));
+      }
+      return [
+        {
+          type: "image_url",
+          image_url: {
+            url,
+          },
+        },
+      ];
+    }
+    return res.choices?.at(0)?.message?.content ?? res;
   }
 
   async chat(options: ChatOptions) {
-    const messages = options.messages.map((v) => ({
-      role: v.role,
-      content: v.content,
-    }));
-
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
       ...useChatStore.getState().currentSession().mask.modelConfig,
       ...{
         model: options.config.model,
+        providerName: options.config.providerName,
       },
     };
 
-    const requestPayload = {
-      messages,
-      stream: options.config.stream,
-      model: modelConfig.model,
-      temperature: modelConfig.temperature,
-      presence_penalty: modelConfig.presence_penalty,
-      frequency_penalty: modelConfig.frequency_penalty,
-      top_p: modelConfig.top_p,
-      // max_tokens: Math.max(modelConfig.max_tokens, 1024),
-      // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
-    };
+    let requestPayload: RequestPayload | DalleRequestPayload;
+
+    const isDalle3 = _isDalle3(options.config.model);
+    if (isDalle3) {
+      const prompt = getMessageTextContent(
+        options.messages.slice(-1)?.pop() as any,
+      );
+      requestPayload = {
+        model: options.config.model,
+        prompt,
+        // URLs are only valid for 60 minutes after the image has been generated.
+        response_format: "b64_json", // using b64_json, and save image in CacheStorage
+        n: 1,
+        size: options.config?.size ?? "1024x1024",
+        quality: options.config?.quality ?? "standard",
+        style: options.config?.style ?? "vivid",
+      };
+    } else {
+      const visionModel = isVisionModel(options.config.model);
+      const messages: ChatOptions["messages"] = [];
+      for (const v of options.messages) {
+        const content = visionModel
+          ? await preProcessImageContent(v.content)
+          : getMessageTextContent(v);
+        messages.push({ role: v.role, content });
+      }
+
+      requestPayload = {
+        messages,
+        stream: options.config.stream,
+        model: modelConfig.model,
+        temperature: modelConfig.temperature,
+        presence_penalty: modelConfig.presence_penalty,
+        frequency_penalty: modelConfig.frequency_penalty,
+        top_p: modelConfig.top_p,
+        // max_tokens: Math.max(modelConfig.max_tokens, 1024),
+        // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
+      };
+
+      // add max_tokens to vision model
+      if (visionModel && modelConfig.model.includes("preview")) {
+        requestPayload["max_tokens"] = Math.max(modelConfig.max_tokens, 4000);
+      }
+    }
 
     console.log("[Request] openai payload: ", requestPayload);
 
-    const shouldStream = !!options.config.stream;
+    const shouldStream = !isDalle3 && !!options.config.stream;
     const controller = new AbortController();
     options.onController?.(controller);
 
     try {
-      const chatPath = this.path(OpenaiPath.ChatPath);
+      let chatPath = "";
+      if (modelConfig.providerName === ServiceProvider.Azure) {
+        // find model, and get displayName as deployName
+        const { models: configModels, customModels: configCustomModels } =
+          useAppConfig.getState();
+        const {
+          defaultModel,
+          customModels: accessCustomModels,
+          useCustomConfig,
+        } = useAccessStore.getState();
+        const models = collectModelsWithDefaultModel(
+          configModels,
+          [configCustomModels, accessCustomModels].join(","),
+          defaultModel,
+        );
+        const model = models.find(
+          (model) =>
+            model.name === modelConfig.model &&
+            model?.provider?.providerName === ServiceProvider.Azure,
+        );
+        chatPath = this.path(
+          (isDalle3 ? Azure.ImagePath : Azure.ChatPath)(
+            (model?.displayName ?? model?.name) as string,
+            useCustomConfig ? useAccessStore.getState().azureApiVersion : "",
+          ),
+        );
+      } else {
+        chatPath = this.path(
+          isDalle3 ? OpenaiPath.ImagePath : OpenaiPath.ChatPath,
+        );
+      }
       const chatPayload = {
         method: "POST",
         body: JSON.stringify(requestPayload),
@@ -110,7 +243,7 @@ export class ChatGPTApi implements LLMApi {
       // make a fetch request
       const requestTimeoutId = setTimeout(
         () => controller.abort(),
-        REQUEST_TIMEOUT_MS,
+        isDalle3 ? REQUEST_TIMEOUT_MS * 2 : REQUEST_TIMEOUT_MS, // dalle3 using b64_json is slow.
       );
 
       if (shouldStream) {
@@ -123,6 +256,9 @@ export class ChatGPTApi implements LLMApi {
           if (finished || controller.signal.aborted) {
             responseText += remainText;
             console.log("[Response Animation] finished");
+            if (responseText?.length === 0) {
+              options.onError?.(new Error("empty response from server"));
+            }
             return;
           }
 
@@ -197,19 +333,31 @@ export class ChatGPTApi implements LLMApi {
             }
             const text = msg.data;
             try {
-              const json = JSON.parse(text) as {
-                choices: Array<{
-                  delta: {
-                    content: string;
-                  };
-                }>;
-              };
-              const delta = json.choices[0]?.delta?.content;
+              const json = JSON.parse(text);
+              const choices = json.choices as Array<{
+                delta: { content: string };
+              }>;
+              const delta = choices[0]?.delta?.content;
+              const textmoderation = json?.prompt_filter_results;
+
               if (delta) {
                 remainText += delta;
               }
+
+              if (
+                textmoderation &&
+                textmoderation.length > 0 &&
+                ServiceProvider.Azure
+              ) {
+                const contentFilterResults =
+                  textmoderation[0]?.content_filter_results;
+                console.log(
+                  `[${ServiceProvider.Azure}] [Text Moderation] flagged categories result:`,
+                  contentFilterResults,
+                );
+              }
             } catch (e) {
-              console.error("[Request] parse error", text);
+              console.error("[Request] parse error", text, msg);
             }
           },
           onclose() {
@@ -226,7 +374,7 @@ export class ChatGPTApi implements LLMApi {
         clearTimeout(requestTimeoutId);
 
         const resJson = await res.json();
-        const message = this.extractMessage(resJson);
+        const message = await this.extractMessage(resJson);
         options.onFinish(message);
       }
     } catch (e) {
@@ -320,9 +468,18 @@ export class ChatGPTApi implements LLMApi {
       return [];
     }
 
+    //由于目前 OpenAI 的 disableListModels 默认为 true，所以当前实际不会运行到这场
+    let seq = 1000; //同 Constant.ts 中的排序保持一致
     return chatModels.map((m) => ({
       name: m.id,
       available: true,
+      sorted: seq++,
+      provider: {
+        id: "openai",
+        providerName: "OpenAI",
+        providerType: "openai",
+        sorted: 1,
+      },
     }));
   }
 }

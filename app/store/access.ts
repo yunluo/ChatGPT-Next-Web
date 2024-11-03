@@ -13,6 +13,8 @@ import {
   MOONSHOT_BASE_URL,
   STABILITY_BASE_URL,
   IFLYTEK_BASE_URL,
+  XAI_BASE_URL,
+  CHATGLM_BASE_URL,
 } from "../constant";
 import { getHeaders } from "../client/api";
 import { getClientConfig } from "../config/client";
@@ -43,6 +45,10 @@ const DEFAULT_MOONSHOT_URL = isApp ? MOONSHOT_BASE_URL : ApiPath.Moonshot;
 const DEFAULT_STABILITY_URL = isApp ? STABILITY_BASE_URL : ApiPath.Stability;
 
 const DEFAULT_IFLYTEK_URL = isApp ? IFLYTEK_BASE_URL : ApiPath.Iflytek;
+
+const DEFAULT_XAI_URL = isApp ? XAI_BASE_URL : ApiPath.XAI;
+
+const DEFAULT_CHATGLM_URL = isApp ? CHATGLM_BASE_URL : ApiPath.ChatGLM;
 
 const DEFAULT_ACCESS_STATE = {
   accessCode: "",
@@ -100,6 +106,14 @@ const DEFAULT_ACCESS_STATE = {
   iflytekUrl: DEFAULT_IFLYTEK_URL,
   iflytekApiKey: "",
   iflytekApiSecret: "",
+
+  // xai
+  xaiUrl: DEFAULT_XAI_URL,
+  xaiApiKey: "",
+
+  // chatglm
+  chatglmUrl: DEFAULT_CHATGLM_URL,
+  chatglmApiKey: "",
 
   // server config
   needCode: true,
@@ -169,6 +183,14 @@ export const useAccessStore = createPersistStore(
       return ensure(get(), ["iflytekApiKey"]);
     },
 
+    isValidXAI() {
+      return ensure(get(), ["xaiApiKey"]);
+    },
+
+    isValidChatGLM() {
+      return ensure(get(), ["chatglmApiKey"]);
+    },
+
     isAuthorized() {
       this.fetch();
 
@@ -184,6 +206,8 @@ export const useAccessStore = createPersistStore(
         this.isValidTencent() ||
         this.isValidMoonshot() ||
         this.isValidIflytek() ||
+        this.isValidXAI() ||
+        this.isValidChatGLM() ||
         !this.enabledAccessControl() ||
         (this.enabledAccessControl() && ensure(get(), ["accessCode"]))
       );
